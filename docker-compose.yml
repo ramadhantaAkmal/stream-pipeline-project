@@ -1,0 +1,406 @@
+version: "3.9"
+
+networks:
+  stream_network:
+    external: true
+    name: stream_network
+
+volumes:
+  clickhouse-data:
+  kafka-data:
+  grafana-data:
+  flink-checkpoints:
+
+services:
+
+# ── 1. KAFKA (KRaft mode) ──────────────────────────
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0
+    container_name: kafka
+    hostname: kafka
+    networks:
+      - stream_network
+    ports:
+      - "9092:9092"   # external (your host machine)
+      - "9101:9101"   # JMX metrics
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_LOG_RETENTION_HOURS: 24
+      KAFKA_LOG_SEGMENT_BYTES: 1073741824
+      CLUSTER_ID: "MkU3OEVBNTcwNTJENDM2Qg"  # fixed cluster ID for KRaft
+    healthcheck:
+      test: ["CMD", "kafka-topics", "--bootstrap-server", "localhost:9092", "--list"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+  # ── 2. SCHEMA REGISTRY ───────────────────────────────────────────────────
+  schema-registry:
+    image: confluentinc/cp-schema-registry:7.6.0
+    container_name: schema-registry
+    hostname: schema-registry
+    networks:
+      - stream_network
+    ports:
+      - "8081:8081"
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: kafka:9092
+      SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+  # ── 3. KAFKA UI (visual dashboard for topics & messages) ─────────────────
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: kafka-ui
+    networks:
+      - stream_network
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local-cluster
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+      KAFKA_CLUSTERS_0_SCHEMAREGISTRY: http://schema-registry:8081
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+# ── 4. CLICKHOUSE ─────────────────────────────────────────────────────────
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.3
+    container_name: clickhouse
+    hostname: clickhouse
+    networks:
+      - stream_network
+    ports:
+      - "8123:8123"   # HTTP interface (query via browser/curl)
+      - "9000:9000"   # Native TCP interface
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+      - ./init-scripts:/docker-entrypoint-initdb.d   # runs SQL on first start
+    environment:
+      CLICKHOUSE_DB: pipeline_db
+      CLICKHOUSE_USER: admin
+      CLICKHOUSE_PASSWORD: admin123
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+
+# ── 5. FAKER PRODUCER (Python service that generates & publishes events) ──
+  producer:
+    build:
+      context: ./producer
+      dockerfile: Dockerfile
+    container_name: faker-producer
+    networks:
+      - stream_network
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_TOPIC: user-events
+      EVENTS_PER_SECOND: 5        # tune this to increase load
+      SCHEMA_REGISTRY_URL: http://schema-registry:8081
+    depends_on:
+      kafka:
+        condition: service_healthy
+      schema-registry:
+        condition: service_started
+    restart: on-failure
+
+# ── 6. CONSUMER (Python service that reads from Kafka → writes to ClickHouse)
+  consumer:
+    build:
+      context: ./consumer
+      dockerfile: Dockerfile
+    container_name: pipeline-consumer
+    networks:
+      - stream_network
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_TOPIC: user-events
+      KAFKA_GROUP_ID: clickhouse-sink-group
+      CLICKHOUSE_HOST: clickhouse
+      CLICKHOUSE_PORT: 8123
+      CLICKHOUSE_DB: pipeline_db
+      CLICKHOUSE_USER: admin
+      CLICKHOUSE_PASSWORD: admin123
+      BATCH_SIZE: 100             # insert N rows at once into ClickHouse
+      BATCH_TIMEOUT_SECONDS: 5   # or flush after this many seconds
+    depends_on:
+      kafka:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    restart: on-failure
+
+# ── 7. FLINK JOBMANAGER (cluster master – schedules & coordinates jobs) ──
+  flink-jobmanager:
+    image: flink:1.19-scala_2.12-java11
+    container_name: flink-jobmanager
+    hostname: flink-jobmanager
+    networks:
+      - stream_network
+    ports:
+      - "8082:8081"   # Flink Web UI (mapped to 8082 to avoid clash with Schema Registry)
+    command: jobmanager
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        jobmanager.memory.process.size: 1600m
+        taskmanager.memory.process.size: 1728m
+        taskmanager.numberOfTaskSlots: 4
+        parallelism.default: 2
+        state.backend: filesystem
+        state.checkpoints.dir: file:///opt/flink/checkpoints
+        execution.checkpointing.interval: 30s
+        execution.checkpointing.mode: EXACTLY_ONCE
+        restart-strategy: fixed-delay
+        restart-strategy.fixed-delay.attempts: 3
+        restart-strategy.fixed-delay.delay: 10s
+    volumes:
+      - flink-checkpoints:/opt/flink/checkpoints
+      - ./flink/jobs:/opt/flink/jobs           # drop your .jar or SQL files here
+      - ./flink/lib:/opt/flink/lib/extra       # drop connector JARs here
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/overview"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+# ── 8. FLINK TASKMANAGER (worker – executes the actual computation) ───────
+  flink-taskmanager:
+    image: flink:1.19-scala_2.12-java11
+    container_name: flink-taskmanager
+    hostname: flink-taskmanager
+    networks:
+      - stream_network
+    command: taskmanager
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        taskmanager.memory.process.size: 1728m
+        taskmanager.numberOfTaskSlots: 4
+        parallelism.default: 2
+        state.backend: filesystem
+        state.checkpoints.dir: file:///opt/flink/checkpoints
+        execution.checkpointing.interval: 30s
+        execution.checkpointing.mode: EXACTLY_ONCE
+    volumes:
+      - flink-checkpoints:/opt/flink/checkpoints
+      - ./flink/lib:/opt/flink/lib/extra
+    depends_on:
+      flink-jobmanager:
+        condition: service_healthy
+    # Scale this horizontally: docker compose up --scale flink-taskmanager=3
+    deploy:
+      replicas: 1
+
+  # ── 9. FLINK SQL CLIENT (run Flink SQL interactively in your terminal) ────
+  flink-sql-client:
+    image: flink:1.19-scala_2.12-java11
+    container_name: flink-sql-client
+    networks:
+      - stream_network
+    command: >
+      /bin/sh -c "
+        echo 'Waiting for JobManager…' &&
+        sleep 15 &&
+        /opt/flink/bin/sql-client.sh embedded
+          -j /opt/flink/lib/extra/flink-sql-connector-kafka-3.2.0-1.19.jar
+          -j /opt/flink/lib/extra/flink-connector-jdbc-3.1.2-1.19.jar
+      "
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        rest.address: flink-jobmanager
+        rest.port: 8081
+    volumes:
+      - ./flink/lib:/opt/flink/lib/extra
+      - ./flink/sql:/opt/flink/sql           # put your .sql job files here
+    depends_on:
+      flink-jobmanager:
+        condition: service_healthy
+    profiles:
+      - sql-client   # only starts with: docker compose --profile sql-client up
+
+  # ── 10. PROMETHEUS (scrapes metrics from Kafka, Flink & ClickHouse) ───────
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    networks:
+      - stream_network
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=7d"
+
+  # ── 11. GRAFANA (visualize metrics) ──────────────────────────────────────
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    networks:
+      - stream_network
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin123
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    depends_on:
+      - prometheus
+
+#AI service
+  # Ollama - Local LLM Server
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_models:/root/.ollama
+    networks:
+      - stream_network
+    restart: unless-stopped
+    environment:
+      - OLLAMA_KEEP_ALIVE=24h
+      - OLLAMA_HOST=0.0.0.0
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    # GPU support
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  # Ollama Model Initializer - Pulls the mistral model on startup
+  ollama-init:
+    image: ollama/ollama:latest
+    container_name: ollama-init
+    depends_on:
+      ollama:
+        condition: service_healthy
+    networks:
+      - stream_network
+    volumes:
+      - ollama_models:/root/.ollama
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+    entrypoint: /bin/bash
+    command: >
+      -c "
+      echo '🤖 Ollama server is ready!' &&
+      echo '📥 Checking if mistral model is already installed...' &&
+      if OLLAMA_HOST=http://ollama:11434 ollama list | grep -q mistral; then
+        echo '✅ Mistral model already installed'
+      else
+        echo '📥 Pulling mistral model (this may take a few minutes)...' &&
+        OLLAMA_HOST=http://ollama:11434 ollama pull mistral &&
+        echo '✅ Mistral model installed successfully!'
+      fi &&
+      echo '🎉 Ollama initialization complete!' &&
+      sleep infinity
+      "
+    restart: "no"
+    healthcheck:
+      test: ["CMD-SHELL", "OLLAMA_HOST=http://ollama:11434 ollama list | grep -q mistral || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 300s
+
+  # MCP Server - Model Context Protocol Server for AI and Analytics
+  mcp-server:
+    build:
+      context: ./mcp
+      dockerfile: Dockerfile
+    container_name: mcp-server
+    ports:
+      - "5000:5000"
+    environment:
+      - DUCKDB_PATH=/app/data/warehouse.duckdb
+      - OLLAMA_URL=http://ollama:11434
+      - OLLAMA_MODEL=mistral
+      - LOG_LEVEL=INFO
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_NAME=ecom
+      - DB_USER=${POSTGRES_USER:-silism}
+      - DB_PASSWORD=${POSTGRES_PASSWORD:-silism123}
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:29092
+    volumes:
+      - ./duckdb_data:/app/data
+    networks:
+      - stream_network
+    depends_on:
+      ollama-init:
+        condition: service_healthy
+      duckdb:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+# Streamlit Dashboard - Modern Analytics Interface
+  streamlit:
+    build:
+      context: ./streamlit
+      dockerfile: Dockerfile
+    container_name: streamlit
+    ports:
+      - "8501:8501"
+      - "9501:9501"  # Metrics endpoint
+    environment:
+      - MCP_SERVER_URL=http://mcp-server:5000
+      - STREAMLIT_SERVER_PORT=8501
+      - STREAMLIT_SERVER_ADDRESS=0.0.0.0
+      - STREAMLIT_BROWSER_GATHER_USAGE_STATS=false
+    networks:
+      - stream_network
+    depends_on:
+      - mcp-server
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8501/_stcore/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+

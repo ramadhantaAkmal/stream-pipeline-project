@@ -1,0 +1,135 @@
+version: "3.9"
+
+networks:
+  stream_network:
+    external: true
+    name: stream_network
+
+volumes:
+  ollama_models:
+    driver: local
+    name: ollama_models
+services:
+#AI service
+  # Ollama - Local LLM Server
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_models:/root/.ollama
+    networks:
+      - stream_network
+    restart: unless-stopped
+    environment:
+      - OLLAMA_KEEP_ALIVE=24h
+      - OLLAMA_HOST=0.0.0.0
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    # GPU support
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  # Ollama Model Initializer - Pulls the mistral model on startup
+  ollama-init:
+    image: ollama/ollama:latest
+    container_name: ollama-init
+    depends_on:
+      ollama:
+        condition: service_healthy
+    networks:
+      - stream_network
+    volumes:
+      - ollama_models:/root/.ollama
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+    entrypoint: /bin/bash
+    command: >
+      -c "
+      echo '🤖 Ollama server is ready!' &&
+      echo '📥 Checking if mistral model is already installed...' &&
+      if OLLAMA_HOST=http://ollama:11434 ollama list | grep -q mistral; then
+        echo '✅ Mistral model already installed'
+      else
+        echo '📥 Pulling mistral model (this may take a few minutes)...' &&
+        OLLAMA_HOST=http://ollama:11434 ollama pull mistral &&
+        echo '✅ Mistral model installed successfully!'
+      fi &&
+      echo '🎉 Ollama initialization complete!' &&
+      sleep infinity
+      "
+    restart: "no"
+    healthcheck:
+      test: ["CMD-SHELL", "OLLAMA_HOST=http://ollama:11434 ollama list | grep -q mistral || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 300s
+
+  # MCP Server - Model Context Protocol Server for AI and Analytics
+  mcp-server:
+    build:
+      context: ./mcp
+      dockerfile: Dockerfile
+    container_name: mcp-server
+    ports:
+      - "5000:5000"
+    environment:
+      - DUCKDB_PATH=/app/data/warehouse.duckdb
+      - OLLAMA_URL=http://ollama:11434
+      - OLLAMA_MODEL=mistral
+      - LOG_LEVEL=INFO
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_NAME=ecom
+      - DB_USER=${POSTGRES_USER:-silism}
+      - DB_PASSWORD=${POSTGRES_PASSWORD:-silism123}
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:29092
+    volumes:
+      - ./duckdb_data:/app/data
+    networks:
+      - stream_network
+    depends_on:
+      ollama-init:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+# Streamlit Dashboard - Modern Analytics Interface
+  streamlit:
+    build:
+      context: ./streamlit
+      dockerfile: Dockerfile
+    container_name: streamlit
+    ports:
+      - "8501:8501"
+      - "9501:9501"  # Metrics endpoint
+    environment:
+      - MCP_SERVER_URL=http://mcp-server:5000
+      - STREAMLIT_SERVER_PORT=8501
+      - STREAMLIT_SERVER_ADDRESS=0.0.0.0
+      - STREAMLIT_BROWSER_GATHER_USAGE_STATS=false
+    networks:
+      - stream_network
+    depends_on:
+      - mcp-server
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8501/_stcore/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
