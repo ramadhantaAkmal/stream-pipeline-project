@@ -1,0 +1,16 @@
+# MCP Server Dependencies
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+pydantic==2.5.0
+
+# Data processing
+clickhouse-connect==0.7.16
+
+# MCP Protocol
+mcp==1.26.0  
+
+# HTTP requests
+requests==2.31.0
+
+# Logging and utilities
+python-dateutil==2.8.2
