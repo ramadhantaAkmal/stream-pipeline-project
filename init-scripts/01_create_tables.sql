@@ -1,4 +1,4 @@
--- init-scripts/01_create_tables.sql
+-- init-scripts/create_tables.sql
 -- This file runs automatically when ClickHouse starts for the first time.
 
 CREATE DATABASE IF NOT EXISTS pipeline_db;

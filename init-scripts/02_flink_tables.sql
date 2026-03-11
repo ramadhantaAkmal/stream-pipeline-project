@@ -1,6 +1,6 @@
--- init-scripts/02_flink_tables.sql
+-- init-scripts/flink_tables.sql
 -- Tables that Flink writes into (via JDBC connector).
--- These run on ClickHouse first start, AFTER 01_create_tables.sql.
+-- These run on ClickHouse first start, AFTER create_tables.sql.
 
 -- ── Flink enriched events (row-level, written by Flink INSERT job) ──────────
 CREATE TABLE IF NOT EXISTS pipeline_db.flink_enriched_events
