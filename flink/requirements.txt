@@ -1,0 +1,17 @@
+# flink/jobs/requirements.txt
+# ─────────────────────────────────────────────────────────────────────────────
+# Dependencies for running PyFlink jobs.
+#
+# NOTE: PyFlink requires Java 11 to be installed on your machine.
+#       Inside Docker (flink-jobmanager / flink-taskmanager) Java is
+#       already included — these deps are only needed for local dev/testing.
+#
+# Install:
+#   pip install -r flink/jobs/requirements.txt
+# ─────────────────────────────────────────────────────────────────────────────
+
+# PyFlink — must match the Flink Docker image version (1.19)
+apache-flink==1.19.0
+
+# Used by job_anomaly_detection.py for timestamp handling
+python-dateutil==2.9.0
