@@ -3,7 +3,7 @@
 
 CREATE DATABASE IF NOT EXISTS pipeline_db;
 
--- ── Main events table ──────────────────────────────────────────────────────
+-- Main events table 
 -- MergeTree is ClickHouse's core engine.
 -- ORDER BY defines the primary index (how data is sorted on disk).
 -- PARTITION BY organises data into daily folders for fast range queries.
@@ -24,7 +24,7 @@ CREATE TABLE IF NOT EXISTS pipeline_db.user_events
 ENGINE = MergeTree()
 PARTITION BY toYYYYMMDD(timestamp)        -- one partition per day
 ORDER BY (event_type, user_id, timestamp) -- primary sort key
-TTL timestamp + INTERVAL 30 DAY           -- auto-delete data older than 30 days
+TTL toDateTime(timestamp) + INTERVAL 30 DAY           -- auto-delete data older than 30 days
 SETTINGS
     index_granularity = 8192;             -- default, tune for your query patterns
 

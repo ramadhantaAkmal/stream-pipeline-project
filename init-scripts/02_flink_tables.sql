@@ -22,7 +22,7 @@ CREATE TABLE IF NOT EXISTS pipeline_db.flink_enriched_events
 ENGINE = MergeTree()
 PARTITION BY toYYYYMMDD(event_time)
 ORDER BY (event_type, user_id, event_time)
-TTL event_time + INTERVAL 30 DAY
+TTL toDateTime(event_time) + INTERVAL 30 DAY
 SETTINGS index_granularity = 8192;
 
 
@@ -40,5 +40,5 @@ CREATE TABLE IF NOT EXISTS pipeline_db.flink_window_counts
 ENGINE = ReplacingMergeTree()             -- Flink may re-emit windows; dedup on merge
 PARTITION BY toYYYYMMDD(window_start)
 ORDER BY (window_start, event_type, device, country)
-TTL window_start + INTERVAL 60 DAY
+TTL toDateTime(window_start) + INTERVAL 60 DAY
 SETTINGS index_granularity = 8192;
