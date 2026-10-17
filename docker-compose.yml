@@ -320,19 +320,19 @@ services:
   #   restart: always
 
 # ── 11. GRAFANA (visualize metrics) ──────────────────────────────────────
-  grafana:
-    image: grafana/grafana:latest
-    container_name: grafana
-    networks:
-      - stream-network
-    ports:
-      - "3000:3000"
-    volumes:
-      - grafana-data:/var/lib/grafana
-    environment:
-      GF_SECURITY_ADMIN_USER: admin
-      GF_SECURITY_ADMIN_PASSWORD: admin123
-      GF_USERS_ALLOW_SIGN_UP: "false"
-    # depends_on:
-    #   - prometheus
-    restart: always
+  # grafana:
+  #   image: grafana/grafana:latest
+  #   container_name: grafana
+  #   networks:
+  #     - stream-network
+  #   ports:
+  #     - "3000:3000"
+  #   volumes:
+  #     - grafana-data:/var/lib/grafana
+  #   environment:
+  #     GF_SECURITY_ADMIN_USER: admin
+  #     GF_SECURITY_ADMIN_PASSWORD: admin123
+  #     GF_USERS_ALLOW_SIGN_UP: "false"
+  #   # depends_on:
+  #   #   - prometheus
+  #   restart: always

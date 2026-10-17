@@ -1,8 +1,8 @@
 {
   "id": null,
-  "title": "MCP Server Monitoring",
+  "title": "Docker Container Monitoring",
   "tags": [
-    "mcp",
+    "container",
     "ai",
     "analytics",
     "llm"
