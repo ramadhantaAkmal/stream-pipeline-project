@@ -27,23 +27,13 @@ Run:
 """
 
 import os
-import json
 import logging
 from datetime import datetime
 
 from pyflink.datastream import StreamExecutionEnvironment, RuntimeExecutionMode
-from pyflink.datastream.functions import ProcessFunction, KeyedProcessFunction
+from pyflink.datastream.functions import KeyedProcessFunction
 from pyflink.datastream.state import ValueStateDescriptor, ListStateDescriptor
 from pyflink.common.typeinfo import Types
-from pyflink.common.watermark_strategy import WatermarkStrategy, TimestampAssigner
-from pyflink.datastream.connectors.kafka import (
-    KafkaSource,
-    KafkaOffsetsInitializer,
-    KafkaSink,
-    KafkaRecordSerializationSchema,
-    DeliveryGuarantee,
-)
-from pyflink.datastream.formats.json import JsonRowDeserializationSchema
 from pyflink.common import Row
 from pyflink.table import StreamTableEnvironment
 
@@ -105,7 +95,7 @@ class RapidPurchaseDetector(KeyedProcessFunction):
         recent.append(now_ms)
         self.purchase_times.update(recent)
 
-        if len(recent) >= RAPID_PURCHASE_COUNT:
+        if len(recent) == RAPID_PURCHASE_COUNT:
             alert = make_alert(
                 alert_type = "RAPID_PURCHASE",
                 user_id    = event.user_id,
@@ -153,6 +143,9 @@ class CountrySwitchDetector(KeyedProcessFunction):
         )
 
     def process_element(self, event: Row, ctx: KeyedProcessFunction.Context):
+        if not event.country:
+            return
+
         now_ms   = ctx.timestamp()
         last_ms  = self.last_seen_ms.value() or 0
 
@@ -194,6 +187,9 @@ def main():
     env.set_parallelism(2)
     env.enable_checkpointing(30_000)
     t_env = StreamTableEnvironment.create(env)
+    t_env.get_config().get_configuration().set_string(
+        "pipeline.name", "flink-anomaly-detection"
+    )
 
     # ── Kafka source (Table API) ──────────────────────────────────────────────
     t_env.execute_sql(f"""
@@ -258,60 +254,39 @@ def main():
         )
     """)
 
-    # ── Alert 1: High-value purchase — pure SQL, no UDF needed ───────────────
-    statement_set = t_env.create_statement_set()
-
-    statement_set.add_insert_sql(f"""
-        INSERT INTO clickhouse_alerts
-        SELECT
-            'HIGH_VALUE_PURCHASE'                                       AS alert_type,
-            user_id,
-            CONCAT(
-                'Purchase of $', CAST(amount AS STRING),
-                ' on ', page,
-                ' from ', country
-            )                                                           AS detail,
-            CASE
-                WHEN amount >= 450 THEN 'CRITICAL'
-                WHEN amount >= 400 THEN 'HIGH'
-                ELSE 'MEDIUM'
-            END                                                         AS severity,
-            CAST(event_time AS STRING)                                  AS detected_at
-        FROM kafka_source
-        WHERE event_type = 'purchase'
-          AND amount >= {HIGH_VALUE_THRESHOLD}
-    """)
-
-    # Also forward high-value alerts to the Kafka alerts topic
-    statement_set.add_insert_sql(f"""
-        INSERT INTO kafka_alerts
-        SELECT
-            'HIGH_VALUE_PURCHASE'                                       AS alert_type,
-            user_id,
-            CONCAT('Purchase of $', CAST(amount AS STRING), ' detected') AS detail,
-            CASE
-                WHEN amount >= 450 THEN 'CRITICAL'
-                ELSE 'HIGH'
-            END                                                         AS severity,
-            CAST(event_time AS STRING)                                  AS detected_at
-        FROM kafka_source
-        WHERE event_type = 'purchase'
-          AND amount >= {HIGH_VALUE_THRESHOLD}
-    """)
-
-    statement_set.execute().wait()
-
-    # ── Alert 2 & 3: Stateful detections via DataStream API ──────────────────
-    # Convert Table to DataStream for keyed stateful processing
+    # Convert the Kafka table once so every detector receives the same events.
     event_table  = t_env.from_path("kafka_source")
-    event_stream = t_env.to_data_stream(event_table)
+    event_stream = t_env.to_data_stream(event_table).filter(
+        lambda event: event.user_id is not None
+    )
 
     alert_type_info = Types.ROW_NAMED(
         ["alert_type", "user_id", "detail", "severity", "detected_at"],
         [Types.STRING(), Types.STRING(), Types.STRING(), Types.STRING(), Types.STRING()]
     )
 
-    # Rapid purchase detector — keyed by user_id
+    # High-value purchases share the same source and sink path as stateful alerts.
+    def make_high_value_alert(event: Row) -> Row:
+        amount = event.amount or 0.0
+        severity = "CRITICAL" if amount >= 450 else "HIGH"
+        return Row(
+            "HIGH_VALUE_PURCHASE",
+            event.user_id,
+            f"Purchase of ${amount:.2f} on {event.page} from {event.country}",
+            severity,
+            str(event.event_time),
+        )
+
+    high_value_alerts = (
+        event_stream
+        .filter(
+            lambda event: event.event_type == "purchase"
+            and event.amount is not None
+            and event.amount >= HIGH_VALUE_THRESHOLD
+        )
+        .map(make_high_value_alert, output_type=alert_type_info)
+    )
+
     rapid_purchase_alerts = (
         event_stream
         .filter(lambda r: r.event_type == "purchase")
@@ -326,17 +301,24 @@ def main():
         .process(CountrySwitchDetector(), output_type=alert_type_info)
     )
 
-    # Merge alert streams and sink to ClickHouse
-    all_stateful_alerts = rapid_purchase_alerts.union(country_switch_alerts)
+    all_alerts = high_value_alerts.union(
+        rapid_purchase_alerts, country_switch_alerts
+    )
+    alerts_table = t_env.from_data_stream(all_alerts)
+    t_env.create_temporary_view("all_alerts", alerts_table)
 
-    stateful_alert_table = t_env.from_data_stream(all_stateful_alerts)
-    t_env.create_temporary_view("stateful_alerts", stateful_alert_table)
-
-    t_env.execute_sql("""
+    statement_set = t_env.create_statement_set()
+    statement_set.add_insert_sql("""
         INSERT INTO clickhouse_alerts
         SELECT alert_type, user_id, detail, severity, detected_at
-        FROM stateful_alerts
-    """).wait()
+        FROM all_alerts
+    """)
+    statement_set.add_insert_sql("""
+        INSERT INTO kafka_alerts
+        SELECT alert_type, user_id, detail, severity, detected_at
+        FROM all_alerts
+    """)
+    statement_set.execute().wait()
 
     log.info("Anomaly detection job submitted successfully.")
 

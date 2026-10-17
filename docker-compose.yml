@@ -275,6 +275,50 @@ services:
         condition: service_healthy
     restart: "no"
 
+# ── Submit the Kafka → Flink → alerts anomaly detection stream ────────────────
+  flink-anomaly-job:
+    image: flink-pyflink:1.19
+    container_name: flink-anomaly-job
+    networks:
+      - stream-network
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - >-
+        set -e;
+        until curl -fsS http://flink-jobmanager:8081/overview > /dev/null; do sleep 2; done;
+        curl -fsS -u "$${CLICKHOUSE_USER}:$${CLICKHOUSE_PASSWORD}"
+        --data-binary 'CREATE DATABASE IF NOT EXISTS pipeline_db' http://clickhouse:8123/;
+        curl -fsS -u "$${CLICKHOUSE_USER}:$${CLICKHOUSE_PASSWORD}"
+        --data-binary "CREATE TABLE IF NOT EXISTS pipeline_db.flink_alerts (alert_type LowCardinality(String), user_id String, detail String, severity LowCardinality(String), detected_at DateTime64(3, 'UTC')) ENGINE = MergeTree() PARTITION BY toYYYYMMDD(detected_at) ORDER BY (detected_at, alert_type, user_id) TTL toDateTime(detected_at) + INTERVAL 30 DAY SETTINGS index_granularity = 8192" http://clickhouse:8123/;
+        if curl -fsS http://flink-jobmanager:8081/jobs/overview
+        | python3 -c 'import json,sys; sys.exit(0 if any(j["name"] == "flink-anomaly-detection" and j["state"] == "RUNNING" for j in json.load(sys.stdin)["jobs"]) else 1)';
+        then echo "Flink anomaly detection job is already running"; exit 0; fi;
+        exec /opt/flink/bin/flink run --detached --jobmanager flink-jobmanager:8081 --python /opt/flink/jobs/job_anomaly_detection.py
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        rest.address: flink-jobmanager
+        rest.port: 8081
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_TOPIC: user-events
+      KAFKA_ALERT_TOPIC: alerts
+      KAFKA_GROUP_ID: flink-anomaly-group
+      CLICKHOUSE_JDBC_URL: jdbc:clickhouse://clickhouse:8123/pipeline_db
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-admin}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-admin123}
+      HIGH_VALUE_THRESHOLD: 400.0
+      RAPID_PURCHASE_COUNT: 3
+      RAPID_PURCHASE_WINDOW_MS: 120000
+      COUNTRY_SWITCH_WINDOW_MS: 300000
+    depends_on:
+      flink-jobmanager:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    restart: "no"
+
 # ── 9. FLINK SQL CLIENT (run Flink SQL interactively in your terminal) ────
   flink-sql-client:
     image: flink-pyflink:1.19
@@ -303,36 +347,3 @@ services:
     profiles:
       - sql-client   # only starts with: docker compose --profile sql-client up
     restart: always
-
-# ── 10. PROMETHEUS (scrapes metrics from Kafka, Flink & ClickHouse) ───────
-  # prometheus:
-  #   image: prom/prometheus:latest
-  #   container_name: prometheus
-  #   networks:
-  #     - stream-network
-  #   ports:
-  #     - "9090:9090"
-  #   volumes:
-  #     - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
-  #   command:
-  #     - "--config.file=/etc/prometheus/prometheus.yml"
-  #     - "--storage.tsdb.retention.time=7d"
-  #   restart: always
-
-# ── 11. GRAFANA (visualize metrics) ──────────────────────────────────────
-  # grafana:
-  #   image: grafana/grafana:latest
-  #   container_name: grafana
-  #   networks:
-  #     - stream-network
-  #   ports:
-  #     - "3000:3000"
-  #   volumes:
-  #     - grafana-data:/var/lib/grafana
-  #   environment:
-  #     GF_SECURITY_ADMIN_USER: admin
-  #     GF_SECURITY_ADMIN_PASSWORD: admin123
-  #     GF_USERS_ALLOW_SIGN_UP: "false"
-  #   # depends_on:
-  #   #   - prometheus
-  #   restart: always
