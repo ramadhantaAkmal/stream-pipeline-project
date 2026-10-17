@@ -15,18 +15,6 @@ datasources:
     url: http://loki:3100
     editable: true
 
-  - name: Tempo
-    type: tempo
-    access: proxy
-    url: http://tempo-enhanced:3200
-    editable: true
-
-  - name: Jaeger
-    type: jaeger
-    access: proxy
-    url: http://jaeger:16686
-    editable: true
-
   - name: ClickHouse
     type: grafana-clickhouse-datasource
     uid: clickhouse

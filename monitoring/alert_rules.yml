@@ -37,26 +37,6 @@ groups:
           summary: "Low disk space on {{ $labels.instance }}"
           description: "Disk space is below 15% on {{ $labels.mountpoint }}."
 
-  - name: database_alerts
-    rules:
-      - alert: PostgreSQLDown
-        expr: up{job="postgres-exporter"} == 0
-        for: 1m
-        labels:
-          severity: critical
-        annotations:
-          summary: "PostgreSQL is down"
-          description: "PostgreSQL database has been down for more than 1 minute."
-
-      - alert: PostgreSQLTooManyConnections
-        expr: pg_stat_database_numbackends / pg_settings_max_connections * 100 > 80
-        for: 5m
-        labels:
-          severity: warning
-        annotations:
-          summary: "PostgreSQL too many connections"
-          description: "PostgreSQL is using more than 80% of available connections."
-
   - name: business_alerts
     rules:
       - alert: RevenueDrop
