@@ -3,7 +3,7 @@
 ACommerce - MCP Server
 =================================
 Model Context Protocol server providing tools, resources, and prompts
-for e-commerce analytics — backed by ClickHouse.
+for e-commerce analytics.
 """
 
 import asyncio
@@ -168,285 +168,260 @@ class BusinessAnalytics:
     def __init__(self, db_manager: DatabaseManager):
         self.db = db_manager
 
-    def get_executive_summary(self) -> Dict[str, Any]:
-        """Generate executive summary with key metrics."""
+    def get_most_visited_pages(self) -> Dict[str, Any]:
         try:
-            metrics_query = f"""
+            query = f"""
             SELECT
-                uniq(customer_fk)                              AS total_customers,
-                sum(total_orders)                              AS total_orders,
-                round(sum(total_revenue), 2)                   AS total_revenue,
-                round(avg(avg_order_value), 2)                 AS avg_order_value,
-                max(concat(
-                    toString(order_year), '-',
-                    leftPad(toString(order_month), 2, '0')
-                ))                                             AS latest_period
-            FROM {CLICKHOUSE_DB}.fct_monthly_revenue
+                page,
+                event_type,
+                COUNT(*) AS event_count
+            FROM {CLICKHOUSE_DB}.user_events
+            GROUP BY page
+            ORDER BY event_count DESC;
             """
 
-            # Revenue trend — last 12 months
-            # ClickHouse uses toString() + leftPad() for zero-padded month formatting
-            trend_query = f"""
-            SELECT
-                concat(
-                    toString(order_year), '-',
-                    leftPad(toString(order_month), 2, '0')
-                )                                              AS period,
-                round(sum(total_revenue), 2)                   AS revenue,
-                uniq(customer_fk)                              AS customers,
-                sum(total_orders)                              AS orders
-            FROM {CLICKHOUSE_DB}.fct_monthly_revenue
-            GROUP BY order_year, order_month
-            ORDER BY order_year DESC, order_month DESC
-            LIMIT 12
-            """
-
-            metrics = self.db.execute_query(metrics_query)
-            trends  = self.db.execute_query(trend_query)
+            result = self.db.execute_query(query)
 
             return {
-                "key_metrics":    metrics["rows"][0] if metrics["rows"] else {},
-                "revenue_trends": trends["rows"],
+                "top_visited_page": result["rows"][0] if  result["rows"] else {},
                 "generated_at":   datetime.now().isoformat(),
             }
 
         except Exception as e:
             logger.error(f"Executive summary generation failed: {e}")
             raise
-
-    def analyze_customer_segments(self) -> Dict[str, Any]:
-        """Analyse customer segmentation."""
+    
+    def get_traffic_revenue_trend(self) -> Dict[str, Any]:
+        """Generate executive summary with key metrics."""
         try:
-            segments_query = f"""
+            query = f"""
             SELECT
-                customer_segment,
-                count()                                AS customer_count,
-                round(avg(lifetime_revenue), 2)        AS avg_lifetime_value,
-                round(avg(estimated_clv), 2)           AS avg_predicted_clv,
-                round(avg(days_since_last_order), 0)   AS avg_days_since_last_order
-            FROM {CLICKHOUSE_DB}.dim_customers
-            GROUP BY customer_segment
-            ORDER BY customer_count DESC
-            """
-            result = self.db.execute_query(segments_query)
-            return {
-                "segments":       result["rows"],
-                "total_segments": len(result["rows"]),
-                "analysis_date":  datetime.now().isoformat(),
-            }
-        except Exception as e:
-            logger.error(f"Customer segmentation analysis failed: {e}")
-            raise
-
-    def analyze_product_performance(self) -> Dict[str, Any]:
-        """Analyse product performance metrics."""
-        try:
-            products_query = f"""
-            SELECT
-                product_name,
-                category,
-                performance_tier,
-                round(total_revenue, 2)      AS revenue,
-                round(revenue_last_30d, 2)   AS revenue_last_30d,
-                total_orders,
-                total_units_sold,
-                days_since_last_sale
-            FROM {CLICKHOUSE_DB}.fct_product_performance
-            ORDER BY total_revenue DESC
-            LIMIT 50
-            """
-
-            category_query = f"""
-            SELECT
-                category,
-                count()                                    AS product_count,
-                round(sum(total_revenue), 2)               AS total_revenue,
-                round(avg(total_revenue), 2)               AS avg_revenue_per_product
-            FROM {CLICKHOUSE_DB}.fct_product_performance
-            GROUP BY category
-            ORDER BY total_revenue DESC
-            """
-
-            products   = self.db.execute_query(products_query)
-            categories = self.db.execute_query(category_query)
-
-            return {
-                "top_products":        products["rows"],
-                "category_performance": categories["rows"],
-                "analysis_date":       datetime.now().isoformat(),
-            }
-
-        except Exception as e:
-            logger.error(f"Product performance analysis failed: {e}")
-            raise
-
-    def generate_business_insights(self, focus_area: str = "general") -> Dict[str, Any]:
-        """Generate business insights based on focus area."""
-        insights = []
-
-        try:
-            if focus_area in ["general", "revenue"]:
-                insights.extend(self._analyze_revenue_patterns())
-            if focus_area in ["general", "customers"]:
-                insights.extend(self._analyze_customer_patterns())
-            if focus_area in ["general", "products"]:
-                insights.extend(self._analyze_product_patterns())
-
-            return {
-                "insights":     insights,
-                "focus_area":   focus_area,
-                "generated_at": datetime.now().isoformat(),
-            }
-
-        except Exception as e:
-            logger.error(f"Business insights generation failed: {e}")
-            raise
-
-    def _analyze_revenue_patterns(self) -> List[Dict[str, Any]]:
-        """Analyse revenue patterns and trends."""
-        insights = []
-        try:
-            # ClickHouse window functions work the same as standard SQL
-            growth_query = f"""
-            WITH monthly_revenue AS (
+                period,
+                SUM(event_count) AS total_events,
+                SUM(total_amount) AS total_revenue
+            FROM
+            (
                 SELECT
-                    order_year,
-                    order_month,
-                    sum(total_revenue) AS revenue
-                FROM {CLICKHOUSE_DB}.fct_monthly_revenue
-                GROUP BY order_year, order_month
-                ORDER BY order_year, order_month
-            ),
-            growth_calc AS (
+                    'last_5_min' AS period,
+                    event_count,
+                    total_amount
+                FROM {CLICKHOUSE_DB}.flink_window_counts
+                WHERE window_start >= now() - INTERVAL 5 MINUTE
+
+                UNION ALL
+
                 SELECT
-                    *,
-                    lagInFrame(revenue) OVER (ORDER BY order_year, order_month) AS prev_revenue
-                FROM monthly_revenue
+                    'prev_5_min' AS period,
+                    event_count,
+                    total_amount
+                FROM {CLICKHOUSE_DB}.flink_window_counts
+                WHERE window_start >= now() - INTERVAL 10 MINUTE
+                AND window_start < now() - INTERVAL 5 MINUTE
             )
-            SELECT
-                concat(
-                    toString(order_year), '-',
-                    leftPad(toString(order_month), 2, '0')
-                )                                               AS period,
-                revenue,
-                round(
-                    (revenue - prev_revenue) / prev_revenue * 100, 2
-                )                                               AS growth_rate
-            FROM growth_calc
-            WHERE prev_revenue IS NOT NULL
-            ORDER BY order_year DESC, order_month DESC
-            LIMIT 6
+            GROUP BY period;
             """
-            growth_data = self.db.execute_query(growth_query)
 
-            if growth_data["rows"]:
-                latest_growth = growth_data["rows"][0]["growth_rate"]
-                avg_growth    = sum(r["growth_rate"] for r in growth_data["rows"]) / len(growth_data["rows"])
+            trends = self.db.execute_query(query)
 
-                if latest_growth and latest_growth > avg_growth * 1.2:
-                    insights.append({
-                        "type":        "revenue_acceleration",
-                        "title":       "Revenue Growth Accelerating",
-                        "description": f"Latest month shows {latest_growth}% growth vs {avg_growth:.1f}% average",
-                        "confidence":  0.85,
-                        "recommendations": [
-                            "Investigate successful marketing channels",
-                            "Scale winning strategies",
-                            "Prepare inventory for increased demand",
-                        ],
-                    })
-                elif latest_growth and latest_growth < avg_growth * 0.5:
-                    insights.append({
-                        "type":        "revenue_deceleration",
-                        "title":       "Revenue Growth Slowing",
-                        "description": f"Latest month shows {latest_growth}% growth vs {avg_growth:.1f}% average",
-                        "confidence":  0.80,
-                        "recommendations": [
-                            "Review marketing effectiveness",
-                            "Analyse customer acquisition costs",
-                            "Consider promotional campaigns",
-                        ],
-                    })
+            return {
+                "trends":    trends["rows"][0] if trends["rows"] else {},
+                "generated_at":   datetime.now().isoformat(),
+            }
 
         except Exception as e:
-            logger.error(f"Revenue pattern analysis failed: {e}")
-
-        return insights
-
-    def _analyze_customer_patterns(self) -> List[Dict[str, Any]]:
-        """Analyse customer behaviour patterns."""
-        insights = []
+            logger.error(f"Traffic-Revenue trend generation failed: {e}")
+            raise
+        
+    def get_conversion_rate(self) -> Dict[str, Any]:
         try:
-            at_risk_query = f"""
+            query = f"""
             SELECT
-                count()                                AS at_risk_count,
-                round(avg(lifetime_revenue), 2)        AS avg_value,
-                round(sum(lifetime_revenue), 2)        AS total_at_risk_value
-            FROM {CLICKHOUSE_DB}.dim_customers
-            WHERE customer_segment = 'At Risk'
+                COUNT(*) AS total_events,
+                COUNTIf(is_purchase = 1) AS total_purchases,
+                SUM(amount_usd) AS revenue,
+                COUNTIf(is_purchase = 1) * 1.0 / COUNT(*) AS conversion_rate
+            FROM {CLICKHOUSE_DB}.flink_enriched_events
+            WHERE event_time >= now() - INTERVAL 15 MINUTE;
             """
-            at_risk_data = self.db.execute_query(at_risk_query)
 
-            if at_risk_data["rows"] and at_risk_data["rows"][0]["at_risk_count"] > 0:
-                info = at_risk_data["rows"][0]
-                insights.append({
-                    "type":        "customer_at_risk",
-                    "title":       "High-Value Customers At Risk",
-                    "description": (
-                        f"{info['at_risk_count']} customers at risk representing "
-                        f"${info['total_at_risk_value']:,.2f} in potential lost revenue"
-                    ),
-                    "confidence":  0.90,
-                    "recommendations": [
-                        "Launch targeted win-back campaigns",
-                        "Offer personalised incentives",
-                        "Conduct customer satisfaction surveys",
-                    ],
-                })
+            result = self.db.execute_query(query)
+
+            return {
+                "conversion_rate":result["rows"][0] if  result["rows"] else {},
+                "generated_at":   datetime.now().isoformat(),
+            }
 
         except Exception as e:
-            logger.error(f"Customer pattern analysis failed: {e}")
+            logger.error(f"Executive summary generation failed: {e}")
+            raise
+        
+    # def generate_business_insights(self, focus_area: str = "general") -> Dict[str, Any]:
+    #     """Generate business insights based on focus area."""
+    #     insights = []
 
-        return insights
+    #     try:
+    #         if focus_area in ["general", "revenue"]:
+    #             insights.extend(self._analyze_revenue_patterns())
+    #         if focus_area in ["general", "customers"]:
+    #             insights.extend(self._analyze_customer_patterns())
+    #         if focus_area in ["general", "products"]:
+    #             insights.extend(self._analyze_product_patterns())
 
-    def _analyze_product_patterns(self) -> List[Dict[str, Any]]:
-        """Analyse product performance patterns."""
-        insights = []
-        try:
-            declining_query = f"""
-            SELECT
-                count()                                    AS low_performing_count,
-                round(sum(total_revenue), 2)               AS low_performing_revenue,
-                round(avg(days_since_last_sale), 2)        AS avg_days_since_sale
-            FROM {CLICKHOUSE_DB}.fct_product_performance
-            WHERE performance_tier = 'Other'
-              AND days_since_last_sale > 30
-            """
-            declining_data = self.db.execute_query(declining_query)
+    #         return {
+    #             "insights":     insights,
+    #             "focus_area":   focus_area,
+    #             "generated_at": datetime.now().isoformat(),
+    #         }
 
-            if declining_data["rows"] and declining_data["rows"][0]["low_performing_count"] > 0:
-                info = declining_data["rows"][0]
-                insights.append({
-                    "type":        "product_low_performance",
-                    "title":       "Low Performing Products Need Attention",
-                    "description": (
-                        f"{info['low_performing_count']} products with no recent sales "
-                        f"(avg {info['avg_days_since_sale']:.0f} days), representing "
-                        f"${info['low_performing_revenue']:,.2f} in revenue"
-                    ),
-                    "confidence": 0.85,
-                    "recommendations": [
-                        "Review pricing strategy for low-performing products",
-                        "Consider promotional campaigns to boost sales",
-                        "Evaluate inventory levels and discontinuation candidates",
-                        "Analyse customer feedback for these products",
-                    ],
-                })
+    #     except Exception as e:
+    #         logger.error(f"Business insights generation failed: {e}")
+    #         raise
 
-        except Exception as e:
-            logger.error(f"Product pattern analysis failed: {e}")
+    # def _analyze_revenue_patterns(self) -> List[Dict[str, Any]]:
+    #     """Analyse revenue patterns and trends."""
+    #     insights = []
+    #     try:
+    #         # ClickHouse window functions work the same as standard SQL
+    #         growth_query = f"""
+    #         WITH monthly_revenue AS (
+    #             SELECT
+    #                 order_year,
+    #                 order_month,
+    #                 sum(total_revenue) AS revenue
+    #             FROM {CLICKHOUSE_DB}.fct_monthly_revenue
+    #             GROUP BY order_year, order_month
+    #             ORDER BY order_year, order_month
+    #         ),
+    #         growth_calc AS (
+    #             SELECT
+    #                 *,
+    #                 lagInFrame(revenue) OVER (ORDER BY order_year, order_month) AS prev_revenue
+    #             FROM monthly_revenue
+    #         )
+    #         SELECT
+    #             concat(
+    #                 toString(order_year), '-',
+    #                 leftPad(toString(order_month), 2, '0')
+    #             )                                               AS period,
+    #             revenue,
+    #             round(
+    #                 (revenue - prev_revenue) / prev_revenue * 100, 2
+    #             )                                               AS growth_rate
+    #         FROM growth_calc
+    #         WHERE prev_revenue IS NOT NULL
+    #         ORDER BY order_year DESC, order_month DESC
+    #         LIMIT 6
+    #         """
+    #         growth_data = self.db.execute_query(growth_query)
 
-        return insights
+    #         if growth_data["rows"]:
+    #             latest_growth = growth_data["rows"][0]["growth_rate"]
+    #             avg_growth    = sum(r["growth_rate"] for r in growth_data["rows"]) / len(growth_data["rows"])
+
+    #             if latest_growth and latest_growth > avg_growth * 1.2:
+    #                 insights.append({
+    #                     "type":        "revenue_acceleration",
+    #                     "title":       "Revenue Growth Accelerating",
+    #                     "description": f"Latest month shows {latest_growth}% growth vs {avg_growth:.1f}% average",
+    #                     "confidence":  0.85,
+    #                     "recommendations": [
+    #                         "Investigate successful marketing channels",
+    #                         "Scale winning strategies",
+    #                         "Prepare inventory for increased demand",
+    #                     ],
+    #                 })
+    #             elif latest_growth and latest_growth < avg_growth * 0.5:
+    #                 insights.append({
+    #                     "type":        "revenue_deceleration",
+    #                     "title":       "Revenue Growth Slowing",
+    #                     "description": f"Latest month shows {latest_growth}% growth vs {avg_growth:.1f}% average",
+    #                     "confidence":  0.80,
+    #                     "recommendations": [
+    #                         "Review marketing effectiveness",
+    #                         "Analyse customer acquisition costs",
+    #                         "Consider promotional campaigns",
+    #                     ],
+    #                 })
+
+    #     except Exception as e:
+    #         logger.error(f"Revenue pattern analysis failed: {e}")
+
+    #     return insights
+
+    # def _analyze_customer_patterns(self) -> List[Dict[str, Any]]:
+    #     """Analyse customer behaviour patterns."""
+    #     insights = []
+    #     try:
+    #         at_risk_query = f"""
+    #         SELECT
+    #             count()                                AS at_risk_count,
+    #             round(avg(lifetime_revenue), 2)        AS avg_value,
+    #             round(sum(lifetime_revenue), 2)        AS total_at_risk_value
+    #         FROM {CLICKHOUSE_DB}.dim_customers
+    #         WHERE customer_segment = 'At Risk'
+    #         """
+    #         at_risk_data = self.db.execute_query(at_risk_query)
+
+    #         if at_risk_data["rows"] and at_risk_data["rows"][0]["at_risk_count"] > 0:
+    #             info = at_risk_data["rows"][0]
+    #             insights.append({
+    #                 "type":        "customer_at_risk",
+    #                 "title":       "High-Value Customers At Risk",
+    #                 "description": (
+    #                     f"{info['at_risk_count']} customers at risk representing "
+    #                     f"${info['total_at_risk_value']:,.2f} in potential lost revenue"
+    #                 ),
+    #                 "confidence":  0.90,
+    #                 "recommendations": [
+    #                     "Launch targeted win-back campaigns",
+    #                     "Offer personalised incentives",
+    #                     "Conduct customer satisfaction surveys",
+    #                 ],
+    #             })
+
+    #     except Exception as e:
+    #         logger.error(f"Customer pattern analysis failed: {e}")
+
+    #     return insights
+
+    # def _analyze_product_patterns(self) -> List[Dict[str, Any]]:
+    #     """Analyse product performance patterns."""
+    #     insights = []
+    #     try:
+    #         declining_query = f"""
+    #         SELECT
+    #             count()                                    AS low_performing_count,
+    #             round(sum(total_revenue), 2)               AS low_performing_revenue,
+    #             round(avg(days_since_last_sale), 2)        AS avg_days_since_sale
+    #         FROM {CLICKHOUSE_DB}.fct_product_performance
+    #         WHERE performance_tier = 'Other'
+    #           AND days_since_last_sale > 30
+    #         """
+    #         declining_data = self.db.execute_query(declining_query)
+
+    #         if declining_data["rows"] and declining_data["rows"][0]["low_performing_count"] > 0:
+    #             info = declining_data["rows"][0]
+    #             insights.append({
+    #                 "type":        "product_low_performance",
+    #                 "title":       "Low Performing Products Need Attention",
+    #                 "description": (
+    #                     f"{info['low_performing_count']} products with no recent sales "
+    #                     f"(avg {info['avg_days_since_sale']:.0f} days), representing "
+    #                     f"${info['low_performing_revenue']:,.2f} in revenue"
+    #                 ),
+    #                 "confidence": 0.85,
+    #                 "recommendations": [
+    #                     "Review pricing strategy for low-performing products",
+    #                     "Consider promotional campaigns to boost sales",
+    #                     "Evaluate inventory levels and discontinuation candidates",
+    #                     "Analyse customer feedback for these products",
+    #                 ],
+    #             })
+
+    #     except Exception as e:
+    #         logger.error(f"Product pattern analysis failed: {e}")
+
+    #     return insights
 
 
 # ── Initialise services ───────────────────────────────────────────────────────
@@ -483,34 +458,49 @@ async def handle_list_tools() -> List[Tool]:
             },
         ),
         Tool(
-            name="analyze_business_metrics",
-            description="Generate comprehensive business analytics and insights",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "focus_area": {
-                        "type": "string",
-                        "enum": ["general", "revenue", "customers", "products"],
-                        "default": "general",
-                    }
-                },
-            },
-        ),
-        Tool(
-            name="get_executive_dashboard",
-            description="Get executive dashboard with key business metrics",
+            name="get_most_visited_pages",
+            description="Get pages data with the most visitor",
             inputSchema={"type": "object", "properties": {}},
         ),
         Tool(
-            name="analyze_customer_segments",
-            description="Analyse customer segmentation and behaviour patterns",
+            name="get_traffic_revenue_trend",
+            description="Get traffic or revenue is up/down n% ",
             inputSchema={"type": "object", "properties": {}},
         ),
         Tool(
-            name="analyze_product_performance",
-            description="Analyse product performance and identify opportunities",
+            name="get_conversion_rate",
+            description="real-time snapshot of key business KPIs—traffic, purchases, revenue, and conversion rate",
             inputSchema={"type": "object", "properties": {}},
         ),
+        # Tool(
+        #     name="analyze_business_metrics",
+        #     description="Generate comprehensive business analytics and insights",
+        #     inputSchema={
+        #         "type": "object",
+        #         "properties": {
+        #             "focus_area": {
+        #                 "type": "string",
+        #                 "enum": ["general", "revenue", "customers", "products"],
+        #                 "default": "general",
+        #             }
+        #         },
+        #     },
+        # ),
+        # Tool(
+        #     name="get_executive_dashboard",
+        #     description="Get executive dashboard with key business metrics",
+        #     inputSchema={"type": "object", "properties": {}},
+        # ),
+        # Tool(
+        #     name="analyze_customer_segments",
+        #     description="Analyse customer segmentation and behaviour patterns",
+        #     inputSchema={"type": "object", "properties": {}},
+        # ),
+        # Tool(
+        #     name="analyze_product_performance",
+        #     description="Analyse product performance and identify opportunities",
+        #     inputSchema={"type": "object", "properties": {}},
+        # ),
     ]
 
 
@@ -539,22 +529,34 @@ async def handle_call_tool(name: str, arguments: dict) -> List[TextContent]:
             schema = db_manager.get_table_schema(table_name)
             return [TextContent(type="text", text=json.dumps(schema, indent=2, default=str))]
 
-        elif name == "analyze_business_metrics":
-            focus_area = arguments.get("focus_area", "general")
-            insights   = analytics_engine.generate_business_insights(focus_area)
-            return [TextContent(type="text", text=json.dumps(insights, indent=2, default=str))]
+        elif name == "get_most_visited_pages":
+            top_visited_page   = analytics_engine.get_most_visited_pages()
+            return [TextContent(type="text", text=json.dumps(top_visited_page, indent=2, default=str))]
+        
+        elif name == "get_traffic_revenue_trend":
+            trends   = analytics_engine.get_traffic_revenue_trend()
+            return [TextContent(type="text", text=json.dumps(trends, indent=2, default=str))]
+        
+        elif name == "get_conversion_rate":
+            comversion_rate = analytics_engine.get_conversion_rate()
+            return [TextContent(type="text", text=json.dumps(comversion_rate, indent=2, default=str))]
+        
+        # elif name == "analyze_business_metrics":
+        #     focus_area = arguments.get("focus_area", "general")
+        #     insights   = analytics_engine.generate_business_insights(focus_area)
+        #     return [TextContent(type="text", text=json.dumps(insights, indent=2, default=str))]
 
-        elif name == "get_executive_dashboard":
-            dashboard = analytics_engine.get_executive_summary()
-            return [TextContent(type="text", text=json.dumps(dashboard, indent=2, default=str))]
+        # elif name == "get_executive_dashboard":
+        #     dashboard = analytics_engine.get_executive_summary()
+        #     return [TextContent(type="text", text=json.dumps(dashboard, indent=2, default=str))]
 
-        elif name == "analyze_customer_segments":
-            segments = analytics_engine.analyze_customer_segments()
-            return [TextContent(type="text", text=json.dumps(segments, indent=2, default=str))]
+        # elif name == "analyze_customer_segments":
+        #     segments = analytics_engine.analyze_customer_segments()
+        #     return [TextContent(type="text", text=json.dumps(segments, indent=2, default=str))]
 
-        elif name == "analyze_product_performance":
-            products = analytics_engine.analyze_product_performance()
-            return [TextContent(type="text", text=json.dumps(products, indent=2, default=str))]
+        # elif name == "analyze_product_performance":
+        #     products = analytics_engine.analyze_product_performance()
+        #     return [TextContent(type="text", text=json.dumps(products, indent=2, default=str))]
 
         else:
             return [TextContent(type="text", text=f"Error: Unknown tool '{name}'")]
@@ -575,23 +577,41 @@ async def handle_list_resources() -> List[Resource]:
             mimeType="application/json",
         ),
         Resource(
-            uri="acommerce://analytics/executive-summary",
-            name="Executive Summary",
-            description="High-level business metrics and KPIs",
+            uri="acommerce://analytics/most-visited-page",
+            name="Most Visited Page",
+            description="List of most visited page",
             mimeType="application/json",
         ),
         Resource(
-            uri="acommerce://analytics/customer-segments",
-            name="Customer Segments",
-            description="Customer segmentation analysis",
+            uri="acommerce://analytics/traffic-revenue-trend",
+            name="Traffic & Revenue Trend",
+            description="Get analysis of traffic revenue trend",
             mimeType="application/json",
         ),
         Resource(
-            uri="acommerce://analytics/product-performance",
-            name="Product Performance",
-            description="Product performance metrics and analysis",
+            uri="acommerce://analytics/conversion-rate",
+            name="Action Convertion Rate",
+            description="Get list of total events convert into revenue",
             mimeType="application/json",
         ),
+        # Resource(
+        #     uri="acommerce://analytics/executive-summary",
+        #     name="Executive Summary",
+        #     description="High-level business metrics and KPIs",
+        #     mimeType="application/json",
+        # ),
+        # Resource(
+        #     uri="acommerce://analytics/customer-segments",
+        #     name="Customer Segments",
+        #     description="Customer segmentation analysis",
+        #     mimeType="application/json",
+        # ),
+        # Resource(
+        #     uri="acommerce://analytics/product-performance",
+        #     name="Product Performance",
+        #     description="Product performance metrics and analysis",
+        #     mimeType="application/json",
+        # ),
         Resource(
             uri="acommerce://schema/warehouse",
             name="Data Warehouse Schema",
@@ -612,14 +632,23 @@ async def handle_read_resource(uri: str) -> str:
                 "last_updated": datetime.now().isoformat(),
             }, indent=2)
 
-        elif uri == "acommerce://analytics/executive-summary":
-            return json.dumps(analytics_engine.get_executive_summary(), indent=2, default=str)
+        elif uri == "acommerce://analytics/most-visited-page":
+            return json.dumps(analytics_engine.get_most_visited_pages(), indent=2, default=str)
+        
+        elif uri == "acommerce://analytics/traffic-revenue-trend":
+            return json.dumps(analytics_engine.get_traffic_revenue_trend(), indent=2, default=str)
+        
+        elif uri == "acommerce://analytics/conversion-rate":
+            return json.dumps(analytics_engine.get_conversion_rate(), indent=2, default=str)
+        
+        # elif uri == "acommerce://analytics/executive-summary":
+        #     return json.dumps(analytics_engine.get_executive_summary(), indent=2, default=str)
 
-        elif uri == "acommerce://analytics/customer-segments":
-            return json.dumps(analytics_engine.analyze_customer_segments(), indent=2, default=str)
+        # elif uri == "acommerce://analytics/customer-segments":
+        #     return json.dumps(analytics_engine.analyze_customer_segments(), indent=2, default=str)
 
-        elif uri == "acommerce://analytics/product-performance":
-            return json.dumps(analytics_engine.analyze_product_performance(), indent=2, default=str)
+        # elif uri == "acommerce://analytics/product-performance":
+        #     return json.dumps(analytics_engine.analyze_product_performance(), indent=2, default=str)
 
         elif uri == "acommerce://schema/warehouse":
             tables      = db_manager.list_tables()
@@ -649,7 +678,7 @@ async def handle_list_prompts() -> List[Prompt]:
     return [
         Prompt(
             name="business_analyst",
-            description="Act as a senior business analyst for e-commerce data analysis",
+            description="Act as a senior business analyst for e-commerce web event data analysis",
             arguments=[
                 PromptArgument(name="question", description="Business question to analyse", required=True),
                 PromptArgument(name="context",  description="Additional context or constraints", required=False),
@@ -680,29 +709,29 @@ async def handle_get_prompt(name: str, arguments: dict) -> PromptMessage:
         if name == "business_analyst":
             question        = arguments.get("question", "")
             context         = arguments.get("context", "")
-            executive_summary  = analytics_engine.get_executive_summary()
-            customer_segments  = analytics_engine.analyze_customer_segments()
+            top_visited_page = analytics_engine.get_most_visited_pages()
+            traffic_revenue_trend = analytics_engine.get_traffic_revenue_trend()
+            events_conversion_rate = analytics_engine.get_conversion_rate()
 
             system_prompt = f"""You are a senior business analyst for ACommerce, an e-commerce company.
-You have access to comprehensive business data stored in ClickHouse and should provide data-driven insights.
+                You have access to comprehensive business data stored in ClickHouse and should provide data-driven insights.
 
-Current Business Context:
-- Total Revenue: ${executive_summary['key_metrics'].get('total_revenue', 0):,.2f}
-- Total Customers: {executive_summary['key_metrics'].get('total_customers', 0):,}
-- Total Orders: {executive_summary['key_metrics'].get('total_orders', 0):,}
-- Customer Segments: {len(customer_segments['segments'])} segments identified
+                Current Business Context:
+                - Most Visited Page: ${top_visited_page['top_visited_page']}
+                - Traffic Revenue Trend: {traffic_revenue_trend['trends']}
+                - Events Conversion Rate: {events_conversion_rate['conversion_rate']}
 
-Question: {question}
-{f'Additional Context: {context}' if context else ''}
+                Question: {question}
+                {f'Additional Context: {context}' if context else ''}
 
-Please provide:
-1. Data-driven analysis
-2. Key insights and trends
-3. Actionable recommendations
-4. Potential risks or opportunities
-5. Specific metrics to support your analysis
+                Please provide:
+                1. Data-driven analysis
+                2. Key insights and trends
+                3. Actionable recommendations
+                4. Potential risks or opportunities
+                5. Specific metrics to support your analysis
 
-Use the available MCP tools to query ClickHouse as needed."""
+                Use the available MCP tools to query ClickHouse as needed."""
 
             return PromptMessage(role=Role.user, content=TextContent(type="text", text=system_prompt))
 
@@ -724,11 +753,11 @@ Use the available MCP tools to query ClickHouse as needed."""
                                 {chr(10).join(f'- {table}' for table in available_tables)}
 
                                 Key Tables:
-                                - {CLICKHOUSE_DB}.dim_customers: Customer dimension with segments, LTV, CLV
-                                - {CLICKHOUSE_DB}.fct_monthly_revenue: Monthly revenue facts by customer
-                                - {CLICKHOUSE_DB}.fct_product_performance: Product performance metrics
-                                - {CLICKHOUSE_DB}.fct_customer_journey: Customer journey and behaviour data
-                                - {CLICKHOUSE_DB}.fct_cohort_analysis: Customer cohort retention analysis
+                                - {CLICKHOUSE_DB}.user_events: Main events table 
+                                - {CLICKHOUSE_DB}.events_per_minute: Materialised view for event counts per minute
+                                - {CLICKHOUSE_DB}.events_by_country: Materialised view for top countries
+                                - {CLICKHOUSE_DB}.flink_enriched_events: row-level enriched version of the raw user_events table
+                                - {CLICKHOUSE_DB}.flink_window_counts: Basic 1-min aggregations, kept for compatibility
 
                                 Question: {question}
                                 {f'Focus on tables: {tables}' if tables else ''}
@@ -801,7 +830,7 @@ async def main():
             read_stream,
             write_stream,
             InitializationOptions(
-                server_name="acommerce",
+                server_name="commerce-analysis",
                 server_version="1.0.0",
                 capabilities=server.get_capabilities(
                     notification_options=NotificationOptions(),

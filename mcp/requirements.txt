@@ -1,7 +1,7 @@
 # MCP Server Dependencies
-fastapi==0.104.1
-uvicorn[standard]==0.24.0
-pydantic==2.5.0
+fastapi==0.135.2
+uvicorn[standard]==0.42.0
+pydantic==2.12.5
 
 # Data processing
 clickhouse-connect==0.7.16

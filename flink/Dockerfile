@@ -22,6 +22,10 @@ RUN pip3 install --no-cache-dir \
 # See flink/lib/README.md for download instructions.
 COPY lib/*.jar /opt/flink/lib/
 
+# Ensure named checkpoint volumes are writable by Flink's runtime user.
+COPY entrypoint-with-permissions.sh /opt/flink/entrypoint-with-permissions.sh
+RUN chmod +x /opt/flink/entrypoint-with-permissions.sh
+
 # ── Copy job files ────────────────────────────────────────────────────────────
 COPY jobs/ /opt/flink/jobs/
 COPY sql/  /opt/flink/sql/

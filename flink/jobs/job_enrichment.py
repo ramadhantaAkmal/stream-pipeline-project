@@ -28,9 +28,8 @@ from pyflink.datastream.connectors.kafka import (
     KafkaOffsetsInitializer,
 )
 from pyflink.datastream.formats.json import JsonRowDeserializationSchema
-from pyflink.common.typeinfo import Types
 from pyflink.common.watermark_strategy import WatermarkStrategy
-from pyflink.table import StreamTableEnvironment
+from pyflink.table import DataTypes, StreamTableEnvironment
 
 logging.basicConfig(
     level=logging.INFO,
@@ -121,7 +120,7 @@ def main():
             is_purchase     BOOLEAN,
             amount_usd      DOUBLE,
             revenue_tier    STRING,
-            session_hour    INT,
+            session_hour    BIGINT,
             platform        STRING
         ) WITH (
             'connector'                     = 'jdbc',
@@ -137,10 +136,9 @@ def main():
 
     # ── Register Python enrichment functions as UDFs ──────────────────────────
     from pyflink.table.udf import udf
-    from pyflink.common import Row
 
-    revenue_tier_udf = udf(get_revenue_tier, result_type=Types.STRING())
-    platform_udf     = udf(get_platform,     result_type=Types.STRING())
+    revenue_tier_udf = udf(get_revenue_tier, result_type=DataTypes.STRING())
+    platform_udf     = udf(get_platform,     result_type=DataTypes.STRING())
 
     t_env.create_temporary_function("get_revenue_tier", revenue_tier_udf)
     t_env.create_temporary_function("get_platform",     platform_udf)

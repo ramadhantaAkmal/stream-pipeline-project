@@ -1,0 +1,25 @@
+server:
+  http_listen_port: 3200
+  log_level: info
+
+distributor:
+  receivers:
+    jaeger:
+      protocols:
+        thrift_http:
+        grpc:
+        thrift_binary:
+        thrift_compact:
+    zipkin:
+    otlp:
+      protocols:
+        http:
+        grpc:
+
+storage:
+  trace:
+    backend: local
+    local:
+      path: /tmp/tempo/traces
+    wal:
+      path: /tmp/tempo/wal

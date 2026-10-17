@@ -17,7 +17,10 @@ CREATE TABLE IF NOT EXISTS pipeline_db.flink_enriched_events
     browser     LowCardinality(String),
     event_time  DateTime64(3, 'UTC'),
     is_purchase UInt8,                    -- BOOLEAN maps to UInt8 in ClickHouse
-    amount_usd  Float64
+    amount_usd  Float64,
+    revenue_tier String,
+    session_hour Int64,
+    platform     String
 )
 ENGINE = MergeTree()
 PARTITION BY toYYYYMMDD(event_time)

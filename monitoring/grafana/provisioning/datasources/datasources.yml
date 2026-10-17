@@ -1,0 +1,43 @@
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    uid: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: true
+
+  - name: Loki
+    type: loki
+    access: proxy
+    url: http://loki:3100
+    editable: true
+
+  - name: Tempo
+    type: tempo
+    access: proxy
+    url: http://tempo-enhanced:3200
+    editable: true
+
+  - name: Jaeger
+    type: jaeger
+    access: proxy
+    url: http://jaeger:16686
+    editable: true
+
+  - name: ClickHouse
+    type: grafana-clickhouse-datasource
+    uid: clickhouse
+    access: proxy
+    url: http://clickhouse:8123
+    editable: true
+    jsonData:
+      host: clickhouse
+      port: 8123
+      protocol: http
+      username: $CLICKHOUSE_USER
+      defaultDatabase: pipeline_db
+    secureJsonData:
+      password: $CLICKHOUSE_PASSWORD

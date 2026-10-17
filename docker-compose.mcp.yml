@@ -1,17 +1,17 @@
 version: "3.9"
 
 networks:
-  stream_network:
+  stream-network:
     external: true
-    name: stream_network
+    name: stream-network
 
 volumes:
   ollama_models:
     driver: local
     name: ollama_models
 services:
-#AI service
-  # Ollama - Local LLM Server
+
+# Ollama - Local LLM Server
   ollama:
     image: ollama/ollama:latest
     container_name: ollama
@@ -20,8 +20,8 @@ services:
     volumes:
       - ollama_models:/root/.ollama
     networks:
-      - stream_network
-    restart: unless-stopped
+      - stream-network
+    restart: always
     environment:
       - OLLAMA_KEEP_ALIVE=24h
       - OLLAMA_HOST=0.0.0.0
@@ -48,7 +48,7 @@ services:
       ollama:
         condition: service_healthy
     networks:
-      - stream_network
+      - stream-network
     volumes:
       - ollama_models:/root/.ollama
     environment:
@@ -85,24 +85,26 @@ services:
     ports:
       - "5000:5000"
     environment:
-      - DUCKDB_PATH=/app/data/warehouse.duckdb
+      - CLICKHOUSE_HOST=clickhouse
+      - CLICKHOUSE_PORT=8123
+      - CLICKHOUSE_DB=pipeline_db
+      - CLICKHOUSE_USER=${CLICKHOUSE_USER:-admin}
+      - CLICKHOUSE_PASSWORD=${CLICKHOUSE_PASSWORD:-admin123}
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - KAFKA_TOPIC=user-events
       - OLLAMA_URL=http://ollama:11434
       - OLLAMA_MODEL=mistral
       - LOG_LEVEL=INFO
-      - DB_HOST=postgres
-      - DB_PORT=5432
-      - DB_NAME=ecom
-      - DB_USER=${POSTGRES_USER:-silism}
-      - DB_PASSWORD=${POSTGRES_PASSWORD:-silism123}
-      - KAFKA_BOOTSTRAP_SERVERS=kafka:29092
-    volumes:
-      - ./duckdb_data:/app/data
     networks:
-      - stream_network
+      - stream-network
     depends_on:
+      clickhouse:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
       ollama-init:
         condition: service_healthy
-    restart: unless-stopped
+    restart: always
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
       interval: 30s
@@ -112,7 +114,7 @@ services:
 # Streamlit Dashboard - Modern Analytics Interface
   streamlit:
     build:
-      context: ./streamlit
+      context: ./streamlit-ai-app
       dockerfile: Dockerfile
     container_name: streamlit
     ports:
@@ -124,10 +126,10 @@ services:
       - STREAMLIT_SERVER_ADDRESS=0.0.0.0
       - STREAMLIT_BROWSER_GATHER_USAGE_STATS=false
     networks:
-      - stream_network
+      - stream-network
     depends_on:
       - mcp-server
-    restart: unless-stopped
+    restart: always
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8501/_stcore/health"]
       interval: 30s

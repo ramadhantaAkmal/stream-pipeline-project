@@ -1,9 +1,9 @@
 version: "3.9"
 
 networks:
-  stream_network:
+  stream-network:
     external: true
-    name: stream_network
+    name: stream-network
 
 volumes:
   clickhouse-data:
@@ -19,10 +19,9 @@ services:
     container_name: kafka
     hostname: kafka
     networks:
-      - stream_network
+      - stream-network
     ports:
       - "9092:9092"   # external (your host machine)
-      - "9101:9101"   # JMX metrics
     environment:
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: broker,controller
@@ -45,14 +44,15 @@ services:
       timeout: 10s
       retries: 10
       start_period: 30s
+    restart: always
 
-  # ── 2. SCHEMA REGISTRY ───────────────────────────────────────────────────
+# ── 2. SCHEMA REGISTRY ───────────────────────────────────────────────────
   schema-registry:
     image: confluentinc/cp-schema-registry:7.6.0
     container_name: schema-registry
     hostname: schema-registry
     networks:
-      - stream_network
+      - stream-network
     ports:
       - "8081:8081"
     environment:
@@ -62,13 +62,14 @@ services:
     depends_on:
       kafka:
         condition: service_healthy
+    restart: always
 
-  # ── 3. KAFKA UI (visual dashboard for topics & messages) ─────────────────
+# ── 3. KAFKA UI (visual dashboard for topics & messages) ─────────────────
   kafka-ui:
     image: provectuslabs/kafka-ui:latest
     container_name: kafka-ui
     networks:
-      - stream_network
+      - stream-network
     ports:
       - "8080:8080"
     environment:
@@ -78,6 +79,7 @@ services:
     depends_on:
       kafka:
         condition: service_healthy
+    restart: always
 
 # ── 4. CLICKHOUSE ─────────────────────────────────────────────────────────
   clickhouse:
@@ -85,17 +87,20 @@ services:
     container_name: clickhouse
     hostname: clickhouse
     networks:
-      - stream_network
+      - stream-network
     ports:
       - "8123:8123"   # HTTP interface (query via browser/curl)
       - "9000:9000"   # Native TCP interface
+      - "9004:9004"   # MySQL wire protocol (used by Flink JDBC sinks)
+      - "9363:9363"   # Prometheus metrics endpoint
     volumes:
       - clickhouse-data:/var/lib/clickhouse
       - ./init-scripts:/docker-entrypoint-initdb.d   # runs SQL on first start
+      - ./monitoring/clickhouse/prometheus.xml:/etc/clickhouse-server/config.d/prometheus.xml:ro
     environment:
       CLICKHOUSE_DB: pipeline_db
-      CLICKHOUSE_USER: admin
-      CLICKHOUSE_PASSWORD: admin123
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-admin}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-admin123}
       CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
     healthcheck:
       test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
@@ -107,15 +112,16 @@ services:
       nofile:
         soft: 262144
         hard: 262144
+    restart: always
 
-# ── 5. FAKER PRODUCER (Python service that generates & publishes events) ──
+# ── 5. PRODUCER (Python service that generates & publishes events) ──
   producer:
     build:
       context: ./producer
       dockerfile: Dockerfile
-    container_name: faker-producer
+    container_name: producer
     networks:
-      - stream_network
+      - stream-network
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
       KAFKA_TOPIC: user-events
@@ -135,7 +141,7 @@ services:
       dockerfile: Dockerfile
     container_name: pipeline-consumer
     networks:
-      - stream_network
+      - stream-network
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
       KAFKA_TOPIC: user-events
@@ -156,14 +162,18 @@ services:
 
 # ── 7. FLINK JOBMANAGER (cluster master – schedules & coordinates jobs) ──
   flink-jobmanager:
-    image: flink:1.19-scala_2.12-java11
+    build:
+      context: ./flink           # uses flink/Dockerfile (has Python + PyFlink)
+      dockerfile: Dockerfile
+    image: flink-pyflink:1.19    # tag the built image so taskmanager reuses it
     container_name: flink-jobmanager
     hostname: flink-jobmanager
     networks:
-      - stream_network
+      - stream-network
     ports:
-      - "8082:8081"   # Flink Web UI (mapped to 8082 to avoid clash with Schema Registry)
+      - "8083:8081"   # Flink Web UI (mapped to 8082 to avoid clash with Schema Registry)
     command: jobmanager
+    entrypoint: ["/opt/flink/entrypoint-with-permissions.sh"]
     environment:
       FLINK_PROPERTIES: |
         jobmanager.rpc.address: flink-jobmanager
@@ -178,25 +188,28 @@ services:
         restart-strategy: fixed-delay
         restart-strategy.fixed-delay.attempts: 3
         restart-strategy.fixed-delay.delay: 10s
+        python.executable: /usr/bin/python3
+        metrics.reporter.prom.factory.class: org.apache.flink.metrics.prometheus.PrometheusReporterFactory
+        metrics.reporter.prom.port: 9249
     volumes:
       - flink-checkpoints:/opt/flink/checkpoints
-      - ./flink/jobs:/opt/flink/jobs           # drop your .jar or SQL files here
-      - ./flink/lib:/opt/flink/lib/extra       # drop connector JARs here
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8081/overview"]
       interval: 15s
       timeout: 10s
       retries: 10
       start_period: 30s
+    restart: always
 
 # ── 8. FLINK TASKMANAGER (worker – executes the actual computation) ───────
   flink-taskmanager:
-    image: flink:1.19-scala_2.12-java11
+    image: flink-pyflink:1.19
     container_name: flink-taskmanager
     hostname: flink-taskmanager
     networks:
-      - stream_network
+      - stream-network
     command: taskmanager
+    entrypoint: ["/opt/flink/entrypoint-with-permissions.sh"]
     environment:
       FLINK_PROPERTIES: |
         jobmanager.rpc.address: flink-jobmanager
@@ -207,22 +220,67 @@ services:
         state.checkpoints.dir: file:///opt/flink/checkpoints
         execution.checkpointing.interval: 30s
         execution.checkpointing.mode: EXACTLY_ONCE
+        python.executable: /usr/bin/python3
+        metrics.reporter.prom.factory.class: org.apache.flink.metrics.prometheus.PrometheusReporterFactory
+        metrics.reporter.prom.port: 9249
     volumes:
       - flink-checkpoints:/opt/flink/checkpoints
-      - ./flink/lib:/opt/flink/lib/extra
     depends_on:
       flink-jobmanager:
         condition: service_healthy
     # Scale this horizontally: docker compose up --scale flink-taskmanager=3
     deploy:
       replicas: 1
+    restart: always
 
-  # ── 9. FLINK SQL CLIENT (run Flink SQL interactively in your terminal) ────
+# ── Submit the Kafka → Flink → ClickHouse enrichment stream ─────────────────
+  flink-enrichment-job:
+    image: flink-pyflink:1.19
+    container_name: flink-enrichment-job
+    networks:
+      - stream-network
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - >-
+        set -e;
+        until curl -fsS http://flink-jobmanager:8081/overview > /dev/null; do sleep 2; done;
+        curl -fsS -u "$${CLICKHOUSE_USER}:$${CLICKHOUSE_PASSWORD}"
+        --data-binary 'CREATE DATABASE IF NOT EXISTS pipeline_db' http://clickhouse:8123/;
+        curl -fsS -u "$${CLICKHOUSE_USER}:$${CLICKHOUSE_PASSWORD}"
+        --data-binary "CREATE TABLE IF NOT EXISTS pipeline_db.flink_enriched_events (event_id String, user_id String, event_type LowCardinality(String), page String, product String, amount Float64, country LowCardinality(String), city String, device LowCardinality(String), browser LowCardinality(String), event_time DateTime64(3, 'UTC'), is_purchase UInt8, amount_usd Float64, revenue_tier String, session_hour Int64, platform String) ENGINE = MergeTree() PARTITION BY toYYYYMMDD(event_time) ORDER BY (event_type, user_id, event_time) TTL toDateTime(event_time) + INTERVAL 30 DAY SETTINGS index_granularity = 8192" http://clickhouse:8123/;
+        curl -fsS -u "$${CLICKHOUSE_USER}:$${CLICKHOUSE_PASSWORD}"
+        --data-binary "CREATE TABLE IF NOT EXISTS pipeline_db.flink_window_counts (window_start DateTime64(3, 'UTC'), window_end DateTime64(3, 'UTC'), event_type LowCardinality(String), device LowCardinality(String), country LowCardinality(String), event_count UInt64, total_amount Float64) ENGINE = ReplacingMergeTree() PARTITION BY toYYYYMMDD(window_start) ORDER BY (window_start, event_type, device, country) TTL toDateTime(window_start) + INTERVAL 60 DAY SETTINGS index_granularity = 8192" http://clickhouse:8123/;
+        if curl -fsS http://flink-jobmanager:8081/jobs/overview
+        | python3 -c 'import json,sys; sys.exit(0 if any(j["name"] == "insert-into_default_catalog.default_database.clickhouse_sink" and j["state"] == "RUNNING" for j in json.load(sys.stdin)["jobs"]) else 1)';
+        then echo "Flink enrichment job is already running"; exit 0; fi;
+        exec /opt/flink/bin/flink run --detached --jobmanager flink-jobmanager:8081 --python /opt/flink/jobs/job_enrichment.py
+    volumes:
+      - ./init-scripts:/opt/clickhouse-init:ro
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        rest.address: flink-jobmanager
+        rest.port: 8081
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_TOPIC: user-events
+      CLICKHOUSE_JDBC_URL: jdbc:clickhouse://clickhouse:8123/pipeline_db
+      CLICKHOUSE_USER: admin
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-admin123}
+    depends_on:
+      flink-jobmanager:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    restart: "no"
+
+# ── 9. FLINK SQL CLIENT (run Flink SQL interactively in your terminal) ────
   flink-sql-client:
-    image: flink:1.19-scala_2.12-java11
+    image: flink-pyflink:1.19
     container_name: flink-sql-client
     networks:
-      - stream_network
+      - stream-network
     command: >
       /bin/sh -c "
         echo 'Waiting for JobManager…' &&
@@ -244,27 +302,29 @@ services:
         condition: service_healthy
     profiles:
       - sql-client   # only starts with: docker compose --profile sql-client up
+    restart: always
 
-  # ── 10. PROMETHEUS (scrapes metrics from Kafka, Flink & ClickHouse) ───────
-  prometheus:
-    image: prom/prometheus:latest
-    container_name: prometheus
-    networks:
-      - stream_network
-    ports:
-      - "9090:9090"
-    volumes:
-      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
-    command:
-      - "--config.file=/etc/prometheus/prometheus.yml"
-      - "--storage.tsdb.retention.time=7d"
+# ── 10. PROMETHEUS (scrapes metrics from Kafka, Flink & ClickHouse) ───────
+  # prometheus:
+  #   image: prom/prometheus:latest
+  #   container_name: prometheus
+  #   networks:
+  #     - stream-network
+  #   ports:
+  #     - "9090:9090"
+  #   volumes:
+  #     - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+  #   command:
+  #     - "--config.file=/etc/prometheus/prometheus.yml"
+  #     - "--storage.tsdb.retention.time=7d"
+  #   restart: always
 
-  # ── 11. GRAFANA (visualize metrics) ──────────────────────────────────────
+# ── 11. GRAFANA (visualize metrics) ──────────────────────────────────────
   grafana:
     image: grafana/grafana:latest
     container_name: grafana
     networks:
-      - stream_network
+      - stream-network
     ports:
       - "3000:3000"
     volumes:
@@ -273,134 +333,6 @@ services:
       GF_SECURITY_ADMIN_USER: admin
       GF_SECURITY_ADMIN_PASSWORD: admin123
       GF_USERS_ALLOW_SIGN_UP: "false"
-    depends_on:
-      - prometheus
-
-#AI service
-  # Ollama - Local LLM Server
-  ollama:
-    image: ollama/ollama:latest
-    container_name: ollama
-    ports:
-      - "11434:11434"
-    volumes:
-      - ollama_models:/root/.ollama
-    networks:
-      - stream_network
-    restart: unless-stopped
-    environment:
-      - OLLAMA_KEEP_ALIVE=24h
-      - OLLAMA_HOST=0.0.0.0
-    healthcheck:
-      test: ["CMD", "ollama", "list"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 30s
-    # GPU support
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
-
-  # Ollama Model Initializer - Pulls the mistral model on startup
-  ollama-init:
-    image: ollama/ollama:latest
-    container_name: ollama-init
-    depends_on:
-      ollama:
-        condition: service_healthy
-    networks:
-      - stream_network
-    volumes:
-      - ollama_models:/root/.ollama
-    environment:
-      - OLLAMA_HOST=http://ollama:11434
-    entrypoint: /bin/bash
-    command: >
-      -c "
-      echo '🤖 Ollama server is ready!' &&
-      echo '📥 Checking if mistral model is already installed...' &&
-      if OLLAMA_HOST=http://ollama:11434 ollama list | grep -q mistral; then
-        echo '✅ Mistral model already installed'
-      else
-        echo '📥 Pulling mistral model (this may take a few minutes)...' &&
-        OLLAMA_HOST=http://ollama:11434 ollama pull mistral &&
-        echo '✅ Mistral model installed successfully!'
-      fi &&
-      echo '🎉 Ollama initialization complete!' &&
-      sleep infinity
-      "
-    restart: "no"
-    healthcheck:
-      test: ["CMD-SHELL", "OLLAMA_HOST=http://ollama:11434 ollama list | grep -q mistral || exit 1"]
-      interval: 30s
-      timeout: 10s
-      retries: 10
-      start_period: 300s
-
-  # MCP Server - Model Context Protocol Server for AI and Analytics
-  mcp-server:
-    build:
-      context: ./mcp
-      dockerfile: Dockerfile
-    container_name: mcp-server
-    ports:
-      - "5000:5000"
-    environment:
-      - DUCKDB_PATH=/app/data/warehouse.duckdb
-      - OLLAMA_URL=http://ollama:11434
-      - OLLAMA_MODEL=mistral
-      - LOG_LEVEL=INFO
-      - DB_HOST=postgres
-      - DB_PORT=5432
-      - DB_NAME=ecom
-      - DB_USER=${POSTGRES_USER:-silism}
-      - DB_PASSWORD=${POSTGRES_PASSWORD:-silism123}
-      - KAFKA_BOOTSTRAP_SERVERS=kafka:29092
-    volumes:
-      - ./duckdb_data:/app/data
-    networks:
-      - stream_network
-    depends_on:
-      ollama-init:
-        condition: service_healthy
-      duckdb:
-        condition: service_started
-      postgres:
-        condition: service_healthy
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-
-# Streamlit Dashboard - Modern Analytics Interface
-  streamlit:
-    build:
-      context: ./streamlit
-      dockerfile: Dockerfile
-    container_name: streamlit
-    ports:
-      - "8501:8501"
-      - "9501:9501"  # Metrics endpoint
-    environment:
-      - MCP_SERVER_URL=http://mcp-server:5000
-      - STREAMLIT_SERVER_PORT=8501
-      - STREAMLIT_SERVER_ADDRESS=0.0.0.0
-      - STREAMLIT_BROWSER_GATHER_USAGE_STATS=false
-    networks:
-      - stream_network
-    depends_on:
-      - mcp-server
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8501/_stcore/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-
+    # depends_on:
+    #   - prometheus
+    restart: always
